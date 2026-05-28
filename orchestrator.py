@@ -1,143 +1,296 @@
-import threading
+from __future__ import annotations
+
+import logging
+import math
+import audioop
 import queue
+import signal
+import threading
 import time
+from collections import deque
+from typing import Callable, Deque, Optional
+
 from audio_streaming import AudioStreamingEngine
-from vad_detector import BargeInDetector
-from transcription import StreamingTranscriptionModule
 from dialogue_memory import DialogueMemoryManager
 from llm_tts_pipeline import LLMTTSPipeline
+from transcription import StreamingTranscriptionModule
+from vad_detector import BargeInDetector
+
+
+LOGGER = logging.getLogger(__name__)
+
 
 class FullDuplexOrchestrator:
-    """
-    Coordinates the synchronized execution loops, multi-threading, 
-    and thread-safe shared state variables.
-    """
-    def __init__(self):
-        print("[Orchestrator] Initializing E2E Multi-Threaded Full-Duplex Dialogue Manager...")
-        
-        self.audio = AudioStreamingEngine()
-        self.vad = BargeInDetector()
-        self.asr = StreamingTranscriptionModule()
-        self.memory = DialogueMemoryManager()
-        self.llm_tts = LLMTTSPipeline(self, self.audio, self.memory)
-        
-        # Thread flags
-        self.is_running = False
-        
-        # State Tracking
-        self.is_agent_speaking = False
-        self.is_user_speaking = False
-        
-        # Barge-In Event Sync
-        self.barge_in_event = threading.Event()
-        
-        # Data Buffers
-        self.user_speech_buffer = b""
-        self.silence_frames = 0
-        self.SILENCE_THRESHOLD = 30 # ~1 second of silence to end turn (30 * 32ms)
-        
-        # Truncation tracking
-        self.spoken_text_buffer = ""
-        self.last_full_agent_response = ""
+    """Coordinates microphone, VAD, ASR, LLM, TTS, playback, and barge-in."""
 
-    def start(self):
+    def __init__(
+        self,
+        llm_model: str = "llama3.2:3b",
+        whisper_model: str = "base",
+        whisper_device: str | None = None,
+        tts_voice: str = "en-US-ChristopherNeural",
+        tts_backend: str = "auto",
+        input_device_index: int | None = None,
+        output_device_index: int | None = None,
+        output_rate: int | None = None,
+        vad_debug: bool = False,
+        event_sink: Callable[[str, str, str | None], None] | None = None,
+    ) -> None:
+        self.running = threading.Event()
+        self.agent_speaking = threading.Event()
+        self.agent_playing = threading.Event()
+        self.user_speaking = threading.Event()
+        self.barge_in_event = threading.Event()
+        self._barge_in_handled = threading.Event()
+        self._state_lock = threading.RLock()
+
+        self._spoken_text_lock = threading.RLock()
+        self._physically_spoken_text = ""
+        self._active_llm_thread: Optional[threading.Thread] = None
+        self._active_asr_thread: Optional[threading.Thread] = None
+        self._event_sink = event_sink
+
+        self.audio = AudioStreamingEngine(
+            input_device_index=input_device_index,
+            output_device_index=output_device_index,
+            output_rate=output_rate,
+            playback_progress_callback=self._on_playback_progress,
+        )
+        self.vad = BargeInDetector(sample_rate=self.audio.rate)
+        self.asr = StreamingTranscriptionModule(
+            model_size=whisper_model,
+            compute_type="int8",
+            device=whisper_device,
+        )
+        self.memory = DialogueMemoryManager()
+        self.llm_tts = LLMTTSPipeline(
+            audio_engine=self.audio,
+            memory_manager=self.memory,
+            cancel_event=self.barge_in_event,
+            agent_done_callback=self._on_agent_done,
+            model=llm_model,
+            voice=tts_voice,
+            tts_backend=tts_backend,
+            event_sink=event_sink,
+        )
+
+        self._processing_thread: Optional[threading.Thread] = None
+        self._window = bytearray()
+        self._pre_roll: Deque[bytes] = deque(maxlen=10)
+        self._speech_buffer = bytearray()
+        self._silence_frames = 0
+        self.silence_release_frames = 8
+        self.end_of_turn_silence_frames = 30
+        self.min_turn_bytes = int(self.audio.rate * 0.25) * self.audio.sample_width
+        self.vad_debug = vad_debug
+        self._debug_frame_count = 0
+
+    def start(self) -> None:
+        if self.running.is_set():
+            return
+        self.running.set()
         self.audio.start_streams()
-        self.is_running = True
-        
-        # Start main input processing loop
-        self.processing_thread = threading.Thread(target=self._audio_processing_loop, daemon=True)
-        self.processing_thread.start()
-        
-        print("\n=======================================================")
-        print(" System Ready. Start speaking into the microphone.")
-        print("=======================================================\n")
-        
+        self._processing_thread = threading.Thread(
+            target=self._audio_processing_loop,
+            name="audio-processing",
+            daemon=True,
+        )
+        self._processing_thread.start()
+        LOGGER.info("System ready. Speak into the microphone.")
+        self._emit("status", "Listening")
+        self._wait_until_stopped()
+
+    def start_background(self) -> None:
+        if self.running.is_set():
+            return
+        thread = threading.Thread(target=self.start, name="orchestrator", daemon=True)
+        thread.start()
+
+    def stop(self) -> None:
+        if not self.running.is_set():
+            return
+        LOGGER.info("Shutting down full-duplex orchestrator.")
+        self._emit("status", "Stopping")
+        self.running.clear()
+        self.barge_in_event.set()
+        self.audio.stop_streams()
+        if self._processing_thread and self._processing_thread.is_alive():
+            self._processing_thread.join(timeout=1.5)
+        if self._active_llm_thread and self._active_llm_thread.is_alive():
+            self._active_llm_thread.join(timeout=2.0)
+
+    def _wait_until_stopped(self) -> None:
         try:
-            while True:
-                time.sleep(0.1)
+            while self.running.is_set():
+                time.sleep(0.2)
         except KeyboardInterrupt:
             self.stop()
-            
-    def stop(self):
-        print("[Orchestrator] Shutting down...")
-        self.is_running = False
-        self.audio.stop_streams()
 
-    def update_spoken_text(self, text):
-        """Called by LLM pipeline to record what has actually been sent to speaker."""
-        self.spoken_text_buffer += text + " "
-
-    def agent_finished_speaking(self):
-        """Called by LLM thread when generation and playback naturally complete."""
-        self.is_agent_speaking = False
-        self.spoken_text_buffer = "" # Reset for next turn
-
-    def handle_barge_in(self):
-        """Execute Barge-In Action: Purge Queues, Truncate Memory, Reset State."""
-        print("\n\n>>> BARGE-IN EVENT DETECTED! <<<")
-        self.barge_in_event.set()
-        
-        # 1. Terminate Audio Output immediately
-        self.audio.flush_output()
-        
-        # 2. Truncate agent's response string in memory
-        self.memory.truncate_last_agent_response(self.spoken_text_buffer)
-        
-        # 3. Instantly toggle dialogue state back to listening
-        self.is_agent_speaking = False
-        self.spoken_text_buffer = ""
-        
-        # Clear the VAD states to prevent bouncing triggers
-        self.vad.reset_states()
-        print(">>> SYSTEM REVERTED TO LISTENING MODE <<<\n")
-
-    def _audio_processing_loop(self):
-        """Continuously pulls chunks from microphone and runs VAD & Buffering."""
-        while self.is_running:
+    def _audio_processing_loop(self) -> None:
+        while self.running.is_set():
             try:
-                frame = self.audio.input_queue.get(timeout=0.1)
+                hop = self.audio.input_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
-                
-            # Run VAD and Check Barge-In
-            barge_in_triggered = self.vad.process_frame(frame, self.is_agent_speaking)
-            
-            if barge_in_triggered:
-                self.handle_barge_in()
-                # User's current speech that triggered barge-in will continue accumulating
-                
-            # If user is speaking, accumulate audio
-            if self.vad.is_user_speaking:
-                if not self.is_user_speaking:
-                    print("[VAD] User started speaking...")
-                    self.is_user_speaking = True
-                    self.user_speech_buffer = b""
-                    
-                self.user_speech_buffer += frame
-                self.silence_frames = 0
-            elif self.is_user_speaking:
-                # User stopped speaking, count silence
-                self.silence_frames += 1
-                self.user_speech_buffer += frame # Capture silence for context
-                
-                if self.silence_frames > self.SILENCE_THRESHOLD:
-                    # User turn finished!
-                    self.is_user_speaking = False
-                    print("[VAD] User finished speaking. Transcribing...")
-                    
-                    # Transcribe
-                    transcript = self.asr.transcribe_buffer(self.user_speech_buffer)
-                    self.user_speech_buffer = b""
-                    
-                    if transcript.strip():
-                        print(f"[User] {transcript}")
-                        self.memory.add_user_message(transcript)
-                        
-                        # Reset Barge-In flag for new turn
-                        self.barge_in_event.clear()
-                        self.is_agent_speaking = True
-                        
-                        # Launch LLM & TTS in background thread
-                        threading.Thread(target=self.llm_tts.generate_and_speak, daemon=True).start()
-                    else:
-                        print("[VAD] Speech ignored (empty transcription).")
+            for frame in self._emit_overlapped_frames(hop):
+                self._handle_analysis_frame(frame)
+
+    def _emit_overlapped_frames(self, hop: bytes):
+        self._window.extend(hop)
+        needed = self.audio.frame_size * self.audio.sample_width
+        step = self.audio.hop_size * self.audio.sample_width
+        while len(self._window) >= needed:
+            frame = bytes(self._window[:needed])
+            del self._window[:step]
+            yield frame
+
+    def _handle_analysis_frame(self, frame: bytes) -> None:
+        self._pre_roll.append(frame)
+        try:
+            barge_in = self.vad.process_frame(frame, self.agent_playing.is_set())
+        except Exception:
+            LOGGER.exception("VAD failed for input frame.")
+            return
+        self._log_vad_debug(frame)
+
+        if barge_in and not self._barge_in_handled.is_set():
+            self._handle_barge_in()
+
+        speaking = self.vad.mark_silence_if_needed(self.silence_release_frames)
+        if speaking:
+            self._on_user_voice_frame(frame)
+        elif self.user_speaking.is_set():
+            self._on_user_silence_frame(frame)
+
+    def _on_user_voice_frame(self, frame: bytes) -> None:
+        if not self.user_speaking.is_set():
+            self.user_speaking.set()
+            self._silence_frames = 0
+            self._speech_buffer = bytearray()
+            for pre in list(self._pre_roll):
+                self._speech_buffer.extend(pre)
+            LOGGER.info("User speech started.")
+            self._emit("status", "Listening to you")
+        self._speech_buffer.extend(frame)
+        self._silence_frames = 0
+
+    def _on_user_silence_frame(self, frame: bytes) -> None:
+        self._speech_buffer.extend(frame)
+        self._silence_frames += 1
+        if self._silence_frames < self.end_of_turn_silence_frames:
+            return
+        audio = bytes(self._speech_buffer)
+        self._speech_buffer = bytearray()
+        self._silence_frames = 0
+        self.user_speaking.clear()
+        if len(audio) < self.min_turn_bytes:
+            return
+        self._start_transcription(audio)
+
+    def _start_transcription(self, audio: bytes) -> None:
+        if self._active_asr_thread and self._active_asr_thread.is_alive():
+            LOGGER.warning("ASR is still busy; dropping overlapping utterance.")
+            self._emit("warning", "Skipped overlapping speech")
+            return
+        self._emit("status", "Transcribing")
+        self._active_asr_thread = threading.Thread(
+            target=self._transcribe_and_respond,
+            args=(audio,),
+            name="asr",
+            daemon=True,
+        )
+        self._active_asr_thread.start()
+
+    def _transcribe_and_respond(self, audio: bytes) -> None:
+        try:
+            transcript = self.asr.transcribe_buffer(audio, sample_rate=self.audio.rate)
+        except Exception:
+            LOGGER.exception("ASR transcription failed.")
+            return
+        if not transcript:
+            LOGGER.info("Ignored empty transcription.")
+            self._emit("status", "Listening")
+            return
+        LOGGER.info("User: %s", transcript)
+        self._emit("message", transcript, "user")
+        self.memory.add_user_message(transcript)
+        self._start_agent_response()
+
+    def _start_agent_response(self) -> None:
+        with self._state_lock:
+            if self._active_llm_thread and self._active_llm_thread.is_alive():
+                self.barge_in_event.set()
+                self.audio.flush_output()
+                self._active_llm_thread.join(timeout=0.5)
+            self.barge_in_event.clear()
+            self._barge_in_handled.clear()
+            self.agent_speaking.set()
+            self.agent_playing.clear()
+            self._emit("status", "Thinking")
+            with self._spoken_text_lock:
+                self._physically_spoken_text = ""
+            self._active_llm_thread = threading.Thread(
+                target=self.llm_tts.generate_and_speak,
+                name="llm-tts",
+                daemon=True,
+            )
+            self._active_llm_thread.start()
+
+    def _handle_barge_in(self) -> None:
+        with self._state_lock:
+            self._barge_in_handled.set()
+            self.barge_in_event.set()
+            self.audio.flush_output()
+            with self._spoken_text_lock:
+                spoken = self._physically_spoken_text
+                self._physically_spoken_text = ""
+            self.memory.truncate_active_agent_response(spoken)
+            self.agent_speaking.clear()
+            self.agent_playing.clear()
+            self.vad.reset_states()
+            LOGGER.warning("BARGE-IN detected. Playback cancelled and memory truncated.")
+            self._emit("barge_in", "Interrupted")
+
+    def _on_playback_progress(self, text_delta: str) -> None:
+        self.agent_playing.set()
+        with self._spoken_text_lock:
+            self._physically_spoken_text += text_delta
+
+    def _on_agent_done(self, interrupted: bool) -> None:
+        with self._state_lock:
+            if not interrupted and not self.barge_in_event.is_set():
+                self.memory.finalize_agent_message()
+            self.agent_speaking.clear()
+            self.agent_playing.clear()
+            self._emit("status", "Listening")
+            with self._spoken_text_lock:
+                self._physically_spoken_text = ""
+
+    def _emit(self, kind: str, message: str, role: str | None = None) -> None:
+        if self._event_sink:
+            self._event_sink(kind, message, role)
+
+    def _log_vad_debug(self, frame: bytes) -> None:
+        if not self.vad_debug:
+            return
+        self._debug_frame_count += 1
+        if self._debug_frame_count % 10 != 0:
+            return
+        rms = audioop.rms(frame, self.audio.sample_width)
+        dbfs = 20 * math.log10(max(rms, 1) / 32768.0)
+        LOGGER.info(
+            "mic rms=%s dbfs=%.1f vad_prob=%.3f voice_frames=%s user_speaking=%s",
+            rms,
+            dbfs,
+            self.vad.last_probability,
+            self.vad.consecutive_voice_frames,
+            self.vad.is_user_speaking,
+        )
+
+
+def install_signal_handlers(orchestrator: FullDuplexOrchestrator) -> None:
+    def _handler(signum, frame):
+        orchestrator.stop()
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
