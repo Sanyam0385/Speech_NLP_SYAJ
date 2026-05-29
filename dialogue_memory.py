@@ -18,11 +18,13 @@ class DialogueMemoryManager:
         self._history: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         self._active_agent_index: int | None = None
 
-    def add_user_message(self, text: str) -> None:
+    def add_user_message(self, text: str, nlp_hint: str | None = None) -> None:
         text = text.strip()
         if not text:
             return
         with self._lock:
+            if nlp_hint:
+                self._history.append({"role": "system", "content": nlp_hint.strip()})
             self._history.append({"role": "user", "content": text})
             self._active_agent_index = None
 

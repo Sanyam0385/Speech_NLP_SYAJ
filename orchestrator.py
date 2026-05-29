@@ -13,6 +13,8 @@ from typing import Callable, Deque, Optional
 from audio_streaming import AudioStreamingEngine
 from dialogue_memory import DialogueMemoryManager
 from llm_tts_pipeline import LLMTTSPipeline
+from nlp_layer import LightweightNLPLayer
+from performance_metrics import PerformanceMetrics
 from transcription import StreamingTranscriptionModule
 from vad_detector import BargeInDetector
 
@@ -35,6 +37,7 @@ class FullDuplexOrchestrator:
         output_rate: int | None = None,
         vad_debug: bool = False,
         event_sink: Callable[[str, str, str | None], None] | None = None,
+        metrics: PerformanceMetrics | None = None,
     ) -> None:
         self.running = threading.Event()
         self.agent_speaking = threading.Event()
@@ -49,6 +52,15 @@ class FullDuplexOrchestrator:
         self._active_llm_thread: Optional[threading.Thread] = None
         self._active_asr_thread: Optional[threading.Thread] = None
         self._event_sink = event_sink
+        self.metrics = metrics or PerformanceMetrics(
+            audio_window_ms=32.0,
+            audio_hop_ms=16.0,
+            barge_in_frames=4,
+            sample_rate=16000,
+            model_name=llm_model,
+            asr_model=whisper_model,
+            tts_backend=tts_backend,
+        )
 
         self.audio = AudioStreamingEngine(
             input_device_index=input_device_index,
@@ -63,6 +75,7 @@ class FullDuplexOrchestrator:
             device=whisper_device,
         )
         self.memory = DialogueMemoryManager()
+        self.nlp = LightweightNLPLayer()
         self.llm_tts = LLMTTSPipeline(
             audio_engine=self.audio,
             memory_manager=self.memory,
@@ -72,6 +85,8 @@ class FullDuplexOrchestrator:
             voice=tts_voice,
             tts_backend=tts_backend,
             event_sink=event_sink,
+            metrics=self.metrics,
+            transcriber=self.asr,
         )
 
         self._processing_thread: Optional[threading.Thread] = None
@@ -170,6 +185,7 @@ class FullDuplexOrchestrator:
             for pre in list(self._pre_roll):
                 self._speech_buffer.extend(pre)
             LOGGER.info("User speech started.")
+            self.metrics.start_turn()
             self._emit("status", "Listening to you")
         self._speech_buffer.extend(frame)
         self._silence_frames = 0
@@ -191,8 +207,10 @@ class FullDuplexOrchestrator:
         if self._active_asr_thread and self._active_asr_thread.is_alive():
             LOGGER.warning("ASR is still busy; dropping overlapping utterance.")
             self._emit("warning", "Skipped overlapping speech")
+            self.metrics.mark_dropped_utterance()
             return
         self._emit("status", "Transcribing")
+        self.metrics.mark_speech_end()
         self._active_asr_thread = threading.Thread(
             target=self._transcribe_and_respond,
             args=(audio,),
@@ -212,8 +230,12 @@ class FullDuplexOrchestrator:
             self._emit("status", "Listening")
             return
         LOGGER.info("User: %s", transcript)
+        semantic_frame = self.nlp.analyze(transcript)
+        LOGGER.info("NLP frame intent=%s entities=%s", semantic_frame.intent, semantic_frame.entities)
+        self.metrics.mark_transcript(transcript)
         self._emit("message", transcript, "user")
-        self.memory.add_user_message(transcript)
+        self.memory.add_user_message(semantic_frame.rewritten_text, nlp_hint=semantic_frame.prompt_hint)
+        self._emit("status", f"Intent: {semantic_frame.intent}")
         self._start_agent_response()
 
     def _start_agent_response(self) -> None:
@@ -249,10 +271,12 @@ class FullDuplexOrchestrator:
             self.agent_playing.clear()
             self.vad.reset_states()
             LOGGER.warning("BARGE-IN detected. Playback cancelled and memory truncated.")
+            self.metrics.mark_barge_in()
             self._emit("barge_in", "Interrupted")
 
     def _on_playback_progress(self, text_delta: str) -> None:
         self.agent_playing.set()
+        self.metrics.mark_playback_start()
         with self._spoken_text_lock:
             self._physically_spoken_text += text_delta
 
@@ -262,6 +286,7 @@ class FullDuplexOrchestrator:
                 self.memory.finalize_agent_message()
             self.agent_speaking.clear()
             self.agent_playing.clear()
+            self.metrics.mark_agent_done(interrupted)
             self._emit("status", "Listening")
             with self._spoken_text_lock:
                 self._physically_spoken_text = ""

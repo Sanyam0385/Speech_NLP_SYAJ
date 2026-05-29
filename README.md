@@ -12,6 +12,24 @@ Production-oriented Python architecture for a real-time spoken dialogue loop wit
 - Ollama streaming chat completion
 - edge-tts non-blocking phrase synthesis and playback
 - memory truncation to the text actually played before interruption
+- local speech preprocessing and transcript postprocessing before LLM prompting
+- local NLP semantic frame extraction (intent + entities + prompt hint)
+
+## Project-Owned NLP + Speech Layers
+
+To keep evaluation balanced between speech engineering and NLP engineering, this repo now includes two local, configurable layers on top of off-the-shelf models:
+
+- `speech_processing.py`
+	- `SpeechPreprocessor`: DC offset removal, silence trimming, gain normalization
+	- `TranscriptPostProcessor`: filler removal, repetition cleanup, confidence gating, custom term restoration
+- `nlp_layer.py`
+	- `LightweightNLPLayer`: intent classification, entity extraction, domain rewrites, and prompt hint generation
+
+Runtime integration:
+
+- ASR path: mic audio -> `SpeechPreprocessor` -> Whisper -> `TranscriptPostProcessor`
+- NLP path: cleaned transcript -> `LightweightNLPLayer` semantic frame -> prompt hint injected into dialogue memory
+- Metrics path: token-level LLM timings, ASR S/I/D breakdown, back-transcription WER, and barge-in percentiles
 
 ## Install
 
@@ -57,6 +75,25 @@ python web_frontend.py --input-device 9 --output-device 8 --llm-model llama3.2:3
 ```
 
 Open <http://127.0.0.1:5000>. The page shows only the current state, parsed user messages, assistant phrases, and barge-in events.
+
+The dashboard also shows live metrics for report writing. Download raw results from:
+
+- <http://127.0.0.1:5000/api/metrics.json>
+- <http://127.0.0.1:5000/api/metrics.csv>
+- <http://127.0.0.1:5000/api/report.md>
+
+For report evaluation, use the Turn Results controls:
+
+- enter the expected transcript in the reference field to calculate ASR WER
+- choose an NLP relevance score from 1-5
+- mark barge-ins as `intent` when you interrupted intentionally or `false` when the system triggered incorrectly
+- use `Mark interruptions intentional` after a deliberate barge-in test session
+
+For CLI-only runs, export metrics on shutdown:
+
+```bash
+python main.py --input-device 9 --output-device 8 --llm-model llama3.2:3b --whisper-model tiny --whisper-device cpu --tts-backend pyttsx3 --metrics-json results.json --metrics-csv results.csv
+```
 
 Use a smaller/faster ASR model for CPU-only smoke tests:
 

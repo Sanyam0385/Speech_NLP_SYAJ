@@ -24,6 +24,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-rate", type=int, default=None, help="Speaker sample rate; defaults to device rate.")
     parser.add_argument("--mic-test", type=float, default=0.0, help="Record mic level for N seconds and exit.")
     parser.add_argument("--probe-input", type=int, default=None, help="Try common formats for one input device and exit.")
+    parser.add_argument("--metrics-json", default=None, help="Write session metrics JSON on shutdown.")
+    parser.add_argument("--metrics-csv", default=None, help="Write per-turn metrics CSV on shutdown.")
     parser.add_argument("--list-devices", action="store_true", help="List PyAudio devices and exit.")
     parser.add_argument("--vad-debug", action="store_true", help="Log microphone level and VAD probability.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
@@ -191,7 +193,15 @@ def main() -> int:
             vad_debug=args.vad_debug,
         )
         install_signal_handlers(orchestrator)
-        orchestrator.start()
+        try:
+            orchestrator.start()
+        finally:
+            if args.metrics_json:
+                orchestrator.metrics.export_json(args.metrics_json)
+                logging.info("Wrote metrics JSON to %s", args.metrics_json)
+            if args.metrics_csv:
+                orchestrator.metrics.export_csv(args.metrics_csv)
+                logging.info("Wrote metrics CSV to %s", args.metrics_csv)
         return 0
     except Exception as exc:
         logging.exception("Fatal startup/runtime error: %s", exc)

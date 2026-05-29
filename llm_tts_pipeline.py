@@ -18,6 +18,7 @@ from pydub import AudioSegment
 
 from audio_streaming import AudioStreamingEngine, PlaybackChunk
 from dialogue_memory import DialogueMemoryManager
+from performance_metrics import PerformanceMetrics
 
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ class LLMTTSPipeline:
         voice: str = "en-US-ChristopherNeural",
         tts_backend: str = "auto",
         event_sink: Callable[[str, str, str | None], None] | None = None,
+        metrics: PerformanceMetrics | None = None,
+        transcriber: object | None = None,
     ) -> None:
         self.audio_engine = audio_engine
         self.memory = memory_manager
@@ -51,7 +54,11 @@ class LLMTTSPipeline:
         self.voice = voice
         self.tts_backend = tts_backend
         self._event_sink = event_sink
+        self.metrics = metrics
+        self.transcriber = transcriber
         self.max_phrase_chars = 120
+        self._bt_pcm_accumulator = bytearray()
+        self._bt_text_accumulator: list[str] = []
 
     def generate_and_speak(self) -> None:
         loop = asyncio.new_event_loop()
@@ -72,9 +79,13 @@ class LLMTTSPipeline:
         messages = self.memory.get_messages()
         self.memory.begin_agent_message()
         phrase_buffer = ""
+        self._bt_pcm_accumulator = bytearray()
+        self._bt_text_accumulator = []
 
         try:
             LOGGER.info("Prompting Ollama model=%s", self.model)
+            if self.metrics:
+                self.metrics.mark_llm_prompt()
             stream = ollama.chat(model=self.model, messages=messages, stream=True)
         except RequestError:
             self.memory.discard_active_agent_message_if_empty()
@@ -93,8 +104,16 @@ class LLMTTSPipeline:
             token = chunk.get("message", {}).get("content", "")
             if not token:
                 continue
+            # record token timestamp for streaming LLM analysis
+            if self.metrics:
+                try:
+                    self.metrics.mark_llm_token()
+                except Exception:
+                    LOGGER.debug("Failed to mark llm token timestamp", exc_info=True)
             if not saw_token:
                 LOGGER.info("Ollama started streaming tokens.")
+                if self.metrics:
+                    self.metrics.mark_llm_first_token()
                 self._emit("status", "Replying")
                 saw_token = True
             self.memory.append_agent_generated_text(token)
@@ -112,6 +131,7 @@ class LLMTTSPipeline:
 
         if phrase_buffer.strip() and not self.cancel_event.is_set():
             await self._synthesize_and_queue(phrase_buffer.strip())
+        self._flush_back_transcription_sample()
         if not self.cancel_event.is_set():
             self.memory.finalize_agent_message()
 
@@ -119,6 +139,8 @@ class LLMTTSPipeline:
         if not text or self.cancel_event.is_set():
             return
         LOGGER.info("TTS phrase: %s", text)
+        if self.metrics:
+            self.metrics.mark_tts_phrase(text)
         self._emit("message", text, "assistant")
         if self.tts_backend == "pyttsx3":
             await asyncio.to_thread(self._synthesize_pyttsx3_and_queue, text)
@@ -126,11 +148,15 @@ class LLMTTSPipeline:
         try:
             await self._synthesize_edge_and_queue(text)
         except aiohttp.ClientResponseError as exc:
+            if self.metrics:
+                self.metrics.mark_tts_failure()
             if self.tts_backend != "auto":
                 raise
             LOGGER.warning("edge-tts failed with HTTP %s; falling back to offline pyttsx3.", exc.status)
             await asyncio.to_thread(self._synthesize_pyttsx3_and_queue, text)
         except aiohttp.WSServerHandshakeError as exc:
+            if self.metrics:
+                self.metrics.mark_tts_failure()
             if self.tts_backend != "auto":
                 raise
             LOGGER.warning("edge-tts websocket failed with HTTP %s; falling back to offline pyttsx3.", exc.status)
@@ -149,6 +175,7 @@ class LLMTTSPipeline:
         segment = AudioSegment.from_file(io.BytesIO(bytes(audio_data)), format="mp3")
         segment = segment.set_frame_rate(self.audio_engine.output_rate).set_channels(1).set_sample_width(2)
         pcm = segment.raw_data
+        self._collect_back_transcription_sample(text, pcm)
         for playback_chunk in self._build_playback_chunks(pcm, text):
             if self.cancel_event.is_set():
                 return
@@ -160,6 +187,8 @@ class LLMTTSPipeline:
         try:
             import pyttsx3
         except ImportError as exc:
+            if self.metrics:
+                self.metrics.mark_tts_failure()
             raise RuntimeError("pyttsx3 is required for offline TTS fallback. Run: pip install pyttsx3") from exc
 
         temp_path = None
@@ -173,6 +202,7 @@ class LLMTTSPipeline:
             if self.cancel_event.is_set():
                 return
             pcm = self._load_wav_as_output_pcm(temp_path)
+            self._collect_back_transcription_sample(text, pcm)
             for playback_chunk in self._build_playback_chunks(pcm, text):
                 if self.cancel_event.is_set():
                     return
@@ -229,3 +259,37 @@ class LLMTTSPipeline:
     def _emit(self, kind: str, message: str, role: str | None = None) -> None:
         if self._event_sink:
             self._event_sink(kind, message, role)
+
+    def _collect_back_transcription_sample(self, text: str, pcm: bytes) -> None:
+        if not self.transcriber or not self.metrics or not pcm:
+            return
+        self._bt_text_accumulator.append(text)
+        self._bt_pcm_accumulator.extend(pcm)
+        # wait for a minimum duration so Whisper is less likely to return empty output
+        bytes_per_second = self.audio_engine.output_rate * 2
+        if len(self._bt_pcm_accumulator) < int(bytes_per_second * 0.75):
+            return
+        self._flush_back_transcription_sample()
+
+    def _flush_back_transcription_sample(self) -> None:
+        if not self.transcriber or not self.metrics or not self._bt_pcm_accumulator:
+            return
+        try:
+            expected_text = " ".join(part.strip() for part in self._bt_text_accumulator if part.strip())
+            if not expected_text:
+                self._bt_pcm_accumulator.clear()
+                self._bt_text_accumulator.clear()
+                return
+            back_text = self.transcriber.transcribe_buffer(
+                bytes(self._bt_pcm_accumulator),
+                sample_rate=self.audio_engine.output_rate,
+            )
+            if back_text and back_text.strip():
+                wer_result = self.metrics._word_error_rate(expected_text, back_text)
+                wer = wer_result[0] if isinstance(wer_result, tuple) else wer_result
+                self.metrics.set_back_transcription_wer(None, wer)
+        except Exception:
+            LOGGER.debug("Back-transcription flush failed", exc_info=True)
+        finally:
+            self._bt_pcm_accumulator.clear()
+            self._bt_text_accumulator.clear()
